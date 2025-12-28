@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+memory_write: append one JSONL entry to the memory file.
+
+Reads a JSON object from stdin with fields:
+  - type (string, required)
+  - content (string, required)
+  - tags (array of strings, optional)
+  - meta (object, optional)
+  - file (string, optional; overrides MEMORY_FILE)
+
+CLI flags (alternative to stdin JSON):
+  --type TYPE
+  --content CONTENT
+  --tags JSON_ARRAY
+  --meta JSON_OBJECT
+  --file PATH
+
+Environment:
+  MEMORY_FILE (default: ~/.codex/memory.jsonl)
+
+Output (JSON):
+  { ok: true, file: "...", entry: {...} }
+EOF
+}
+
+json_error() {
+  local message="$1"
+  jq -cn --arg message "$message" '{ok:false,error:{message:$message}}'
+}
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s\n' '{"ok":false,"error":{"message":"jq is required but was not found on PATH"}}'
+  exit 127
+fi
+
+input_json=''
+type=''
+content=''
+tags_json='null'
+meta_json='null'
+file_override=''
+
+if [[ ! -t 0 ]]; then
+  input_json="$(</dev/stdin)"
+fi
+
+if [[ -n "${input_json}" ]]; then
+  if ! jq -e . >/dev/null 2>&1 <<<"${input_json}"; then
+    json_error "stdin is not valid JSON" && exit 2
+  fi
+
+  type="$(jq -r '.type // empty' <<<"${input_json}")"
+  content="$(jq -r '.content // empty' <<<"${input_json}")"
+  tags_json="$(jq -c '.tags // null' <<<"${input_json}")"
+  meta_json="$(jq -c '.meta // null' <<<"${input_json}")"
+  file_override="$(jq -r '.file // empty' <<<"${input_json}")"
+else
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --type)
+        type="${2-}"; shift 2
+        ;;
+      --content)
+        content="${2-}"; shift 2
+        ;;
+      --tags)
+        tags_json="${2-}"; shift 2
+        ;;
+      --meta)
+        meta_json="${2-}"; shift 2
+        ;;
+      --file)
+        file_override="${2-}"; shift 2
+        ;;
+      *)
+        json_error "unknown argument: $1" && exit 2
+        ;;
+    esac
+  done
+fi
+
+if [[ -z "${type}" ]]; then
+  json_error "missing required field: type" && exit 2
+fi
+if [[ -z "${content}" ]]; then
+  json_error "missing required field: content" && exit 2
+fi
+
+if [[ -n "${file_override}" ]]; then
+  MEMORY_FILE="${file_override}"
+else
+  MEMORY_FILE="${MEMORY_FILE:-${HOME}/.codex/memory.jsonl}"
+fi
+
+dir="${MEMORY_FILE%/*}"
+if [[ "${dir}" == "${MEMORY_FILE}" ]]; then
+  dir="."
+fi
+mkdir -p "${dir}"
+touch "${MEMORY_FILE}"
+
+if ! jq -e '. == null or (type == "array" and all(.[]; type == "string"))' >/dev/null 2>&1 <<<"${tags_json}"; then
+  json_error "tags must be an array of strings or null" && exit 2
+fi
+if ! jq -e '. == null or (type == "object")' >/dev/null 2>&1 <<<"${meta_json}"; then
+  json_error "meta must be an object or null" && exit 2
+fi
+
+entry_json="$(
+  jq -cn \
+    --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg type "${type}" \
+    --arg content "${content}" \
+    --argjson tags "${tags_json}" \
+    --argjson meta "${meta_json}" \
+    '{ts:$ts,type:$type,content:$content,tags:$tags,meta:$meta}'
+)"
+
+printf '%s\n' "${entry_json}" >>"${MEMORY_FILE}"
+
+jq -cn --arg file "${MEMORY_FILE}" --argjson entry "${entry_json}" '{ok:true,file:$file,entry:$entry}'

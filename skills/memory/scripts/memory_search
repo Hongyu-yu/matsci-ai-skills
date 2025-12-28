@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+memory_search: search recent JSONL entries.
+
+Reads a JSON object from stdin with fields:
+  - q (string, required)         Query string (literal substring by default)
+  - limit (int, optional)        Default: 20
+  - window_lines (int, optional) Default: 50000
+  - mode (string, optional)      "hybrid" (default), "rg", "grep", "jq"
+  - file (string, optional)      Overrides MEMORY_FILE
+
+Query rules:
+  - If q looks like /.../ it is treated as a regex (without the slashes).
+  - Otherwise it is treated as a literal substring.
+
+CLI flags (alternative to stdin JSON):
+  --q QUERY
+  --limit N
+  --window-lines N
+  --mode MODE
+  --file PATH
+
+Environment:
+  MEMORY_FILE (default: ~/.codex/memory.jsonl)
+  MAX_WINDOW_LINES (default: 1000000)
+
+Output (JSON):
+  { ok:true, results:[...], truncated:bool, used_window_lines:int, mode_used:string }
+EOF
+}
+
+json_error() {
+  local message="$1"
+  jq -cn --arg message "$message" '{ok:false,error:{message:$message}}'
+}
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s\n' '{"ok":false,"error":{"message":"jq is required but was not found on PATH"}}'
+  exit 127
+fi
+
+input_json=''
+q=''
+limit='20'
+window_lines='50000'
+mode='hybrid'
+file_override=''
+
+if [[ ! -t 0 ]]; then
+  input_json="$(</dev/stdin)"
+fi
+
+if [[ -n "${input_json}" ]]; then
+  if ! jq -e . >/dev/null 2>&1 <<<"${input_json}"; then
+    json_error "stdin is not valid JSON" && exit 2
+  fi
+  q="$(jq -r '.q // empty' <<<"${input_json}")"
+  limit="$(jq -r '.limit // 20' <<<"${input_json}")"
+  window_lines="$(jq -r '.window_lines // 50000' <<<"${input_json}")"
+  mode="$(jq -r '.mode // "hybrid"' <<<"${input_json}")"
+  file_override="$(jq -r '.file // empty' <<<"${input_json}")"
+else
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --q)
+        q="${2-}"; shift 2
+        ;;
+      --limit)
+        limit="${2-}"; shift 2
+        ;;
+      --window-lines)
+        window_lines="${2-}"; shift 2
+        ;;
+      --mode)
+        mode="${2-}"; shift 2
+        ;;
+      --file)
+        file_override="${2-}"; shift 2
+        ;;
+      *)
+        json_error "unknown argument: $1" && exit 2
+        ;;
+    esac
+  done
+fi
+
+if [[ -z "${q}" ]]; then
+  json_error "missing required field: q" && exit 2
+fi
+if ! [[ "${limit}" =~ ^[0-9]+$ ]] || [[ "${limit}" -le 0 ]]; then
+  json_error "limit must be a positive integer" && exit 2
+fi
+if ! [[ "${window_lines}" =~ ^[0-9]+$ ]] || [[ "${window_lines}" -le 0 ]]; then
+  json_error "window_lines must be a positive integer" && exit 2
+fi
+
+if [[ -n "${file_override}" ]]; then
+  MEMORY_FILE="${file_override}"
+else
+  MEMORY_FILE="${MEMORY_FILE:-${HOME}/.codex/memory.jsonl}"
+fi
+
+max_window_lines="${MAX_WINDOW_LINES:-1000000}"
+if ! [[ "${max_window_lines}" =~ ^[0-9]+$ ]] || [[ "${max_window_lines}" -le 0 ]]; then
+  json_error "MAX_WINDOW_LINES must be a positive integer" && exit 2
+fi
+
+if [[ ! -f "${MEMORY_FILE}" ]]; then
+  jq -cn \
+    --arg file "${MEMORY_FILE}" \
+    --arg q "${q}" \
+    --argjson limit "${limit}" \
+    --argjson used_window_lines "${window_lines}" \
+    '{ok:true,file:$file,q:$q,limit:$limit,used_window_lines:$used_window_lines,truncated:false,mode_used:"none",results:[]}'
+  exit 0
+fi
+
+regex=0
+pattern="${q}"
+if [[ "${q}" =~ ^/.*/$ ]] && [[ ${#q} -ge 2 ]]; then
+  pattern="${q:1:${#q}-2}"
+  regex=1
+fi
+
+mode_used='none'
+filter_cmd=''
+filter_args=()
+
+case "${mode}" in
+  hybrid|rg|grep|jq) ;;
+  *)
+    json_error 'mode must be one of: "hybrid", "rg", "grep", "jq"' && exit 2
+    ;;
+esac
+
+if [[ "${mode}" == "jq" ]]; then
+  mode_used='jq'
+fi
+
+case "${mode}" in
+  hybrid|rg)
+    if command -v rg >/dev/null 2>&1; then
+      mode_used='rg'
+      if [[ "${regex}" -eq 1 ]]; then
+        filter_cmd='rg'
+        filter_args=(-- "${pattern}")
+      else
+        filter_cmd='rg'
+        filter_args=(-F -- "${pattern}")
+      fi
+    else
+      mode='grep'
+    fi
+    ;;
+esac
+
+if [[ "${mode}" == "grep" || "${mode}" == "hybrid" ]]; then
+  if command -v grep >/dev/null 2>&1; then
+    mode_used='grep'
+    if [[ "${regex}" -eq 1 ]]; then
+      filter_cmd='grep'
+      filter_args=(-E -- "${pattern}")
+    else
+      filter_cmd='grep'
+      filter_args=(-F -- "${pattern}")
+    fi
+  else
+    json_error "neither rg nor grep is available on PATH" && exit 127
+  fi
+fi
+
+reverse_used="none"
+reverse_cmd=()
+if command -v tac >/dev/null 2>&1; then
+  reverse_cmd=(tac)
+  reverse_used="tac"
+else
+  if printf 'x\n' | tail -r >/dev/null 2>&1; then
+    reverse_cmd=(tail -r)
+    reverse_used="tail-r"
+  fi
+fi
+
+used_window_lines="${window_lines}"
+results_json='[]'
+truncated='false'
+
+emit_window() {
+  local n="$1"
+  if [[ "${reverse_used}" != "none" ]]; then
+    tail -n "${n}" "${MEMORY_FILE}" | "${reverse_cmd[@]}"
+  else
+    tail -n "${n}" "${MEMORY_FILE}"
+  fi
+}
+
+file_has_more_than_n_lines() {
+  local n="$1"
+  local file="$2"
+  local count=0
+  local line=''
+
+  while IFS= read -r line; do
+    count=$((count + 1))
+    if [[ "${count}" -gt "${n}" ]]; then
+      return 0
+    fi
+  done < <(tail -n "$((n + 1))" "${file}" 2>/dev/null || true)
+
+  return 1
+}
+
+while :; do
+  used_window_lines="${window_lines}"
+
+  # Reverse the window so newest entries come first (best-effort fallback if tac is unavailable).
+  # Then filter and collect into an array.
+  if [[ "${mode}" == "jq" ]]; then
+    if [[ "${regex}" -eq 1 ]]; then
+      matches_json="$(
+        emit_window "${window_lines}" \
+          | jq -Rcr 'fromjson? | select(.)' \
+          | jq -cs --arg q "${pattern}" 'map(select((.content // "" | tostring) | test($q)))'
+      )"
+    else
+      matches_json="$(
+        emit_window "${window_lines}" \
+          | jq -Rcr 'fromjson? | select(.)' \
+          | jq -cs --arg q "${pattern}" 'map(select((.content // "" | tostring) | contains($q)))'
+      )"
+    fi
+  else
+    matches_json="$(
+      emit_window "${window_lines}" \
+        | ( "${filter_cmd}" "${filter_args[@]}" || true ) \
+        | jq -Rcr 'fromjson? | select(.)' \
+        | jq -s '.'
+    )"
+  fi
+
+  match_count="$(jq -r 'length' <<<"${matches_json}")"
+  if [[ "${match_count}" -gt "${limit}" ]]; then
+    truncated='true'
+  else
+    truncated='false'
+  fi
+
+  results_json="$(jq -c --argjson limit "${limit}" '.[0:$limit]' <<<"${matches_json}")"
+  result_count="$(jq -r 'length' <<<"${results_json}")"
+
+  if [[ "${result_count}" -ge "${limit}" ]]; then
+    break
+  fi
+  if [[ "${window_lines}" -ge "${max_window_lines}" ]]; then
+    break
+  fi
+  if ! file_has_more_than_n_lines "${window_lines}" "${MEMORY_FILE}"; then
+    break
+  fi
+  next_window="$(( window_lines * 4 ))"
+  if [[ "${next_window}" -le "${window_lines}" ]]; then
+    window_lines="${max_window_lines}"
+  else
+    if [[ "${next_window}" -gt "${max_window_lines}" ]]; then
+      window_lines="${max_window_lines}"
+    else
+      window_lines="${next_window}"
+    fi
+  fi
+done
+
+jq -cn \
+  --arg file "${MEMORY_FILE}" \
+  --arg q "${q}" \
+  --argjson limit "${limit}" \
+  --argjson used_window_lines "${used_window_lines}" \
+  --argjson truncated "${truncated}" \
+  --arg mode_used "${mode_used}" \
+  --arg reverse_used "${reverse_used}" \
+  --argjson results "${results_json}" \
+  '{ok:true,file:$file,q:$q,limit:$limit,used_window_lines:$used_window_lines,truncated:$truncated,mode_used:$mode_used,reverse_used:$reverse_used,results:$results}'
