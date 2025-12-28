@@ -8,8 +8,7 @@
   <a href="#-quick-start">Quick Start</a> •
   <a href="#-skill-categories">Skills</a> •
   <a href="#-custom-skills">Custom Skills</a> •
-  <a href="#-contributing">Contributing</a> •
-  <a href="#-roadmap">Roadmap</a>
+  <a href="#-contributing">Contributing</a>
 </p>
 
 <p align="center">
