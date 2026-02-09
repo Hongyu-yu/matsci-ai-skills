@@ -82,7 +82,7 @@ skills/
 ### 3. 使用示例
 
 **与 Claude 配合使用：**
-1. 在 Claude Project 中添加 `skills/pymatgen-core/SKILL.md` 作为 Project Knowledge
+1. 在 Claude 的skills目录中添加需要的skills文件夹
 2. 直接对话："帮我创建一个 Fe2O3 的结构并导出为 POSCAR"
 
 **与 Codex 配合使用：**
